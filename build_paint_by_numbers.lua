@@ -118,15 +118,22 @@ return {
         Hard = 128,
         ["Extreme / Unreal"] = 256,
     },
+    DifficultyOrder = { "Easy", "Medium", "Hard", "Extreme / Unreal" },
     UpgradeMaxLevel = 3,
     UpgradeCosts = {
-        Splash = { 150, 500, 1500 },
-        ColorBomb = { 250, 750, 2000 },
         AutoBrush = { 100, 350, 1000 },
+        AreaBrush = { 150, 500, 1500 },
+        ColorHint = { 120, 400, 1200 },
     },
-    SplashRadiusByLevel = { 1, 2, 3 },
-    SplashCooldownByLevel = { 5, 3, 1.5 },
-    ColorBombCost = 15,
+    -- Level 1 is a 1x2 brush, level 2 is 2x2, and level 3 is 3x3.
+    AreaBrushSizeByLevel = {
+        { Width = 1, Height = 2 },
+        { Width = 2, Height = 2 },
+        { Width = 3, Height = 3 },
+    },
+    AreaBrushCooldownByLevel = { 4, 2.5, 1.25 },
+    ColorHintCooldownByLevel = { 8, 5, 3 },
+    ColorHintDurationByLevel = { 3, 5, 8 },
     DifficultyReward = {
         Easy = 75,
         Medium = 150,
@@ -414,13 +421,13 @@ local function defaultProfile()
     return {
         Version = Config.Version,
         Gems = Config.StartingGems,
-        Upgrades = { Splash = 0, ColorBomb = 0, AutoBrush = 0 },
+        Upgrades = { AutoBrush = 0, AreaBrush = 0, ColorHint = 0 },
         ArtProgress = {},
     }
 end
 
 local function copyUpgrades(input)
-    local result = { Splash = 0, ColorBomb = 0, AutoBrush = 0 }
+    local result = { AutoBrush = 0, AreaBrush = 0, ColorHint = 0 }
     if type(input) == "table" then
         for key in pairs(result) do
             local value = tonumber(input[key]) or 0
@@ -452,17 +459,47 @@ local function normalizeProfile(raw)
     return profile
 end
 
+local function normalizeArtDefinition(definition)
+    if type(definition) ~= "table" or type(definition.Id) ~= "string" then
+        return false, "definition needs Id"
+    end
+    if type(definition.Variants) == "table" then
+        if type(definition.Name) ~= "string" or definition.Name == "" then
+            return false, "definition needs Name"
+        end
+        local validVariant = false
+        for difficulty, variant in pairs(definition.Variants) do
+            if type(variant) == "table" then
+                variant.Id = definition.Id
+                variant.Name = variant.Name or definition.Name
+                variant.Difficulty = variant.Difficulty or difficulty
+                local valid, reason = Codec.IsValidArt(variant, Config.MaxSupportedColors)
+                if not valid then
+                    return false, "variant " .. tostring(difficulty) .. ": " .. tostring(reason)
+                end
+                validVariant = true
+            end
+        end
+        if not validVariant then
+            return false, "Variants is empty"
+        end
+        return true
+    end
+    local valid, reason = Codec.IsValidArt(definition, Config.MaxSupportedColors)
+    return valid, reason
+end
+
 local function loadArtDefinitions()
     table.clear(ArtDefinitions)
     for _, module in ipairs(artLibrary:GetChildren()) do
         if module:IsA("ModuleScript") then
             local ok, artOrError = pcall(require, module)
             if ok then
-                local valid, reason = Codec.IsValidArt(artOrError, Config.MaxSupportedColors)
+                local valid, reason = normalizeArtDefinition(artOrError)
                 if valid and not ArtDefinitions[artOrError.Id] then
                     ArtDefinitions[artOrError.Id] = artOrError
                 else
-                    warn("PaintByNumbers: ignoring " .. module:GetFullName() .. ": " .. tostring(reason))
+                    warn("PaintByNumbers: ignoring " .. module:GetFullName() .. ": " .. tostring(reason or "duplicate Id"))
                 end
             else
                 warn("PaintByNumbers: could not require " .. module:GetFullName() .. ": " .. tostring(artOrError))
@@ -542,7 +579,7 @@ local function persistSession(player)
     if not session or not profile then
         return
     end
-    profile.ArtProgress[session.ArtId] = {
+    profile.ArtProgress[session.ProgressKey] = {
         Bits = Codec.EncodeBits(session.Painted, session.Total),
         Count = session.Count,
         Complete = session.Count >= session.Total,
@@ -610,6 +647,8 @@ local function loadProfile(player)
     ProfileChanged:FireClient(player, profileSummary(profile))
 end
 
+local ScaledVariants = {}
+
 local function getArt(artId)
     if type(artId) ~= "string" then
         return nil
@@ -617,9 +656,78 @@ local function getArt(artId)
     return ArtDefinitions[artId]
 end
 
-local function getSavedState(profile, art)
-    local saved = profile.ArtProgress[art.Id]
-    local painted, count = Codec.DecodeBits(saved and saved.Bits, art.Width * art.Height)
+local function progressKey(baseArt, variant)
+    -- Difficulty is part of the save key even for legacy single-resolution
+    -- modules, because the server may generate 32/64/128/256 fallbacks.
+    return baseArt.Id .. "@" .. tostring(variant.Difficulty)
+end
+
+local function scaleFixedArt(sourceArt, difficulty, rewardOverride)
+    local targetSize = Config.AllowedSizes[difficulty]
+    if not targetSize or not sourceArt or not sourceArt.Width or not sourceArt.Height then
+        return nil
+    end
+    ScaledVariants[sourceArt.Id] = ScaledVariants[sourceArt.Id] or {}
+    if ScaledVariants[sourceArt.Id][difficulty] then
+        return ScaledVariants[sourceArt.Id][difficulty]
+    end
+    local pixels = table.create(targetSize * targetSize)
+    local writeIndex = 1
+    for y = 1, targetSize do
+        local sourceY = math.floor((y - 1) * sourceArt.Height / targetSize) + 1
+        for x = 1, targetSize do
+            local sourceX = math.floor((x - 1) * sourceArt.Width / targetSize) + 1
+            local sourceIndex = (sourceY - 1) * sourceArt.Width + sourceX
+            pixels[writeIndex] = string.sub(sourceArt.Pixels, sourceIndex, sourceIndex)
+            writeIndex += 1
+        end
+    end
+    local variant = {
+        Id = sourceArt.Id,
+        Name = sourceArt.Name,
+        Difficulty = difficulty,
+        Width = targetSize,
+        Height = targetSize,
+        Reward = rewardOverride or sourceArt.Reward or Config.DifficultyReward[difficulty],
+        PaletteSize = sourceArt.PaletteSize,
+        Palette = sourceArt.Palette,
+        Pixels = table.concat(pixels),
+    }
+    ScaledVariants[sourceArt.Id][difficulty] = variant
+    return variant
+end
+
+local function resolveVariant(baseArt, difficulty)
+    difficulty = difficulty or baseArt.Difficulty or "Easy"
+    if baseArt.Variants then
+        local variant = baseArt.Variants[difficulty]
+        if variant then
+            return variant
+        end
+        -- A partial Variants table is accepted: nearest-neighbour scale the
+        -- first available source variant for any missing difficulty.
+        for _, candidateDifficulty in ipairs(Config.DifficultyOrder) do
+            local source = baseArt.Variants[candidateDifficulty]
+            if source then
+                return scaleFixedArt(source, difficulty, Config.DifficultyReward[difficulty])
+            end
+        end
+        return nil
+    end
+    if difficulty == baseArt.Difficulty then
+        return baseArt
+    end
+    return scaleFixedArt(baseArt, difficulty, Config.DifficultyReward[difficulty])
+end
+
+local function getSavedState(profile, baseArt, variant)
+    local key = progressKey(baseArt, variant)
+    local saved = profile.ArtProgress[key]
+    -- Read old saves made before difficulty variants existed.
+    if not saved and not baseArt.Variants and variant.Difficulty == baseArt.Difficulty then
+        saved = profile.ArtProgress[baseArt.Id]
+    end
+    local painted, count = Codec.DecodeBits(saved and saved.Bits, variant.Width * variant.Height)
     if saved and tonumber(saved.Count) and tonumber(saved.Count) == count then
         count = tonumber(saved.Count)
     end
@@ -692,35 +800,44 @@ GetProfile.OnServerInvoke = function(player)
     }
 end
 
-StartArt.OnServerInvoke = function(player, artId)
+StartArt.OnServerInvoke = function(player, artId, difficulty)
     local profile = Profiles[player]
-    local art = getArt(artId)
+    local baseArt = getArt(artId)
     if not profile then
         return resultError("ProfileLoading")
     end
-    if not art then
+    if not baseArt then
         return resultError("UnknownArt")
+    end
+    local variant = resolveVariant(baseArt, difficulty)
+    if not variant then
+        return resultError("UnknownDifficulty")
     end
     -- Preserve the previous active canvas when the player goes back to the
     -- gallery and opens another art before the next autosave.
     if Sessions[player] then
         persistSession(player)
     end
-    local painted, count = getSavedState(profile, art)
+    local key = progressKey(baseArt, variant)
+    local painted, count = getSavedState(profile, baseArt, variant)
     Sessions[player] = {
-        ArtId = art.Id,
+        ArtId = baseArt.Id,
+        Difficulty = variant.Difficulty,
+        ProgressKey = key,
+        Art = variant,
         Painted = painted,
         Count = count,
-        Total = art.Width * art.Height,
-        Completed = count >= art.Width * art.Height,
+        Total = variant.Width * variant.Height,
+        Completed = count >= variant.Width * variant.Height,
         LastPaint = 0,
-        LastSplash = 0,
-        LastBomb = 0,
+        LastAreaBrush = 0,
+        LastColorHint = 0,
     }
     return {
         Ok = true,
-        Art = publicArt(art),
-        Bits = Codec.EncodeBits(painted, art.Width * art.Height),
+        Art = publicArt(variant),
+        ProgressKey = key,
+        Bits = Codec.EncodeBits(painted, variant.Width * variant.Height),
         Count = count,
         Gems = profile.Gems,
         Upgrades = table.clone(profile.Upgrades),
@@ -736,7 +853,7 @@ local function validatePaintRequest(player, artId, x, y, colorId)
     if session.ArtId ~= artId then
         return nil, nil, resultError("ArtSessionMismatch")
     end
-    local art = getArt(artId)
+    local art = session.Art
     if not art then
         return nil, nil, resultError("UnknownArt")
     end
@@ -761,13 +878,16 @@ local function validatePaintRequest(player, artId, x, y, colorId)
     }, profile, nil
 end
 
-PaintPixel.OnServerInvoke = function(player, artId, x, y, colorId)
+PaintPixel.OnServerInvoke = function(player, artId, x, y, colorId, continuous)
     local request, profile, failure = validatePaintRequest(player, artId, x, y, colorId)
     if failure then
         return failure
     end
     local session = request.Session
     local art = request.Art
+    if continuous == true and (tonumber(profile.Upgrades.AutoBrush) or 0) < 1 then
+        return resultError("AbilityLocked", { Ability = "AutoBrush" })
+    end
     local now = os.clock()
     -- This is a server-side guard for Auto-Brush and intentionally generous
     -- for normal taps. It prevents a malformed client from flooding invokes.
@@ -787,10 +907,10 @@ PaintPixel.OnServerInvoke = function(player, artId, x, y, colorId)
     -- Keep the active bit table mutable. Encoding a 65,536-bit string on
     -- every click would turn an Extreme canvas into an O(n^2) server task;
     -- persistSession encodes it during autosave/exit/completion instead.
-    local progress = profile.ArtProgress[art.Id] or {}
+    local progress = profile.ArtProgress[session.ProgressKey] or {}
     progress.Count = session.Count
     progress.Complete = session.Count >= session.Total
-    profile.ArtProgress[art.Id] = progress
+    profile.ArtProgress[session.ProgressKey] = progress
     local reward = finishIfComplete(player, session, profile, art)
     return {
         Ok = true,
@@ -837,48 +957,56 @@ UseAbility.OnServerInvoke = function(player, artId, abilityName, x, y, colorId)
 
     local changed = 0
     local encodedBits
-    if abilityName == "Splash" then
-        local cooldown = Config.SplashCooldownByLevel[level] or Config.SplashCooldownByLevel[#Config.SplashCooldownByLevel]
-        if now - session.LastSplash < cooldown then
-            return resultError("Cooldown", { Cooldown = cooldown - (now - session.LastSplash) })
+    local hintColor
+    local hintCount
+    local hintDuration
+    if abilityName == "AreaBrush" then
+        local cooldown = Config.AreaBrushCooldownByLevel[level] or Config.AreaBrushCooldownByLevel[#Config.AreaBrushCooldownByLevel]
+        if now - session.LastAreaBrush < cooldown then
+            return resultError("Cooldown", { Cooldown = cooldown - (now - session.LastAreaBrush) })
         end
-        session.LastSplash = now
-        local radius = Config.SplashRadiusByLevel[level] or 1
-        for row = request.Y - radius, request.Y + radius do
-            for column = request.X - radius, request.X + radius do
+        session.LastAreaBrush = now
+        local size = Config.AreaBrushSizeByLevel[level] or Config.AreaBrushSizeByLevel[#Config.AreaBrushSizeByLevel]
+        local left = math.floor((size.Width - 1) / 2)
+        local top = math.floor((size.Height - 1) / 2)
+        for row = request.Y - top, request.Y - top + size.Height - 1 do
+            for column = request.X - left, request.X - left + size.Width - 1 do
                 if fillCorrectCell(session, art, column, row, request.ColorId) then
                     changed += 1
                 end
             end
         end
-    elseif abilityName == "ColorBomb" then
-        if now - session.LastBomb < 0.25 then
-            return resultError("Cooldown", { Cooldown = 0.25 - (now - session.LastBomb) })
+    elseif abilityName == "ColorHint" then
+        local cooldown = Config.ColorHintCooldownByLevel[level] or Config.ColorHintCooldownByLevel[#Config.ColorHintCooldownByLevel]
+        if now - session.LastColorHint < cooldown then
+            return resultError("Cooldown", { Cooldown = cooldown - (now - session.LastColorHint) })
         end
-        if profile.Gems < Config.ColorBombCost then
-            return resultError("NotEnoughGems", { Cost = Config.ColorBombCost })
-        end
-        session.LastBomb = now
-        profile.Gems -= Config.ColorBombCost
+        session.LastColorHint = now
+        local remainingByColor = table.create(art.PaletteSize, 0)
         for index = 1, session.Total do
-            if not session.Painted[index] and Codec.GetPixelId(art, index) == request.ColorId then
-                session.Painted[index] = true
-                session.Count += 1
-                changed += 1
+            if not session.Painted[index] then
+                local colorIdAtPixel = Codec.GetPixelId(art, index)
+                remainingByColor[colorIdAtPixel] = (remainingByColor[colorIdAtPixel] or 0) + 1
             end
         end
-        syncLeaderstats(player)
+        for colorIdAtPalette = 1, art.PaletteSize do
+            if not hintCount or remainingByColor[colorIdAtPalette] > hintCount then
+                hintColor = colorIdAtPalette
+                hintCount = remainingByColor[colorIdAtPalette]
+            end
+        end
+        hintDuration = Config.ColorHintDurationByLevel[level] or Config.ColorHintDurationByLevel[#Config.ColorHintDurationByLevel]
     else
         return resultError("UnknownAbility")
     end
 
     if changed > 0 then
-        local progress = profile.ArtProgress[art.Id] or {}
+        local progress = profile.ArtProgress[session.ProgressKey] or {}
         progress.Count = session.Count
         progress.Complete = session.Count >= session.Total
         encodedBits = Codec.EncodeBits(session.Painted, session.Total)
         progress.Bits = encodedBits
-        profile.ArtProgress[art.Id] = progress
+        profile.ArtProgress[session.ProgressKey] = progress
     end
     local reward = finishIfComplete(player, session, profile, art)
     return {
@@ -891,6 +1019,9 @@ UseAbility.OnServerInvoke = function(player, artId, abilityName, x, y, colorId)
         Completed = reward ~= nil,
         Reward = reward or 0,
         Gems = profile.Gems,
+        HintColor = hintColor,
+        HintCount = hintCount,
+        HintDuration = hintDuration,
     }
 end
 
@@ -951,7 +1082,7 @@ AdminAction.OnServerInvoke = function(player, action, artId)
     if not session or session.ArtId ~= artId then
         return resultError("NoActiveArt")
     end
-    local art = getArt(artId)
+    local art = session.Art
     if not art then
         return resultError("UnknownArt")
     end
@@ -975,7 +1106,7 @@ AdminAction.OnServerInvoke = function(player, action, artId)
         session.Painted = {}
         session.Count = 0
         session.Completed = false
-        profile.ArtProgress[art.Id] = nil
+        profile.ArtProgress[session.ProgressKey] = nil
         task.spawn(function() saveProfile(player) end)
         return {
             Ok = true,
@@ -1073,6 +1204,11 @@ local levelGrid = catalog:FindFirstChild("LevelGrid", true)
 local cardTemplate = catalog:FindFirstChild("CardTemplate", true)
 local noArtsLabel = catalog:FindFirstChild("NoArts", true)
 local navHome = catalog:FindFirstChild("Home", true)
+local difficultyModal = catalog:FindFirstChild("DifficultyModal", true)
+local difficultyArtName = catalog:FindFirstChild("DifficultyArtName", true)
+local difficultyButtons = catalog:FindFirstChild("DifficultyButtons", true)
+local difficultyTemplate = catalog:FindFirstChild("DifficultyTemplate", true)
+local difficultyClose = catalog:FindFirstChild("DifficultyClose", true)
 local paintBack = paint:FindFirstChild("BackButton", true)
 local paintingName = paint:FindFirstChild("PaintingName", true)
 local paintingDifficulty = paint:FindFirstChild("PaintingDifficulty", true)
@@ -1094,9 +1230,12 @@ local virtualLayer = canvasViewport:WaitForChild("VirtualLayer")
 local paletteButtons = paint:FindFirstChild("PaletteButtons", true)
 local paletteTemplate = paint:FindFirstChild("PaletteButtonTemplate", true)
 local colorHint = paint:WaitForChild("ColorHint")
-local splashButton = paint:WaitForChild("SplashButton")
-local bombButton = paint:WaitForChild("ColorBombButton")
-local autoButton = paint:WaitForChild("AutoBrushButton")
+local areaButton = paint:FindFirstChild("AreaBrushButton", true)
+local hintButton = paint:FindFirstChild("ColorHintButton", true)
+local autoButton = paint:FindFirstChild("AutoBrushButton", true)
+if not areaButton or not hintButton or not autoButton then
+    error("PaintByNumbers: ability buttons are missing from generated UI")
+end
 local victory = paint:WaitForChild("VictoryModal")
 local victoryText = victory:WaitForChild("Message")
 local victoryClose = victory:WaitForChild("ContinueButton")
@@ -1104,11 +1243,14 @@ local toast = root:WaitForChild("Toast")
 local shopClose = shop:FindFirstChild("CloseButton", true)
 pcall(function() canvasSurface.ResampleMode = Enum.ResamplerMode.Pixelated end)
 
-local profile = { Gems = Config.StartingGems, Upgrades = { Splash = 0, ColorBomb = 0, AutoBrush = 0 }, Progress = {} }
+local profile = { Gems = Config.StartingGems, Upgrades = { AutoBrush = 0, AreaBrush = 0, ColorHint = 0 }, Progress = {} }
 local arts = {}
 local artById = {}
 local currentArt
 local currentArtId
+local currentDifficulty
+local currentProgressKey
+local pendingArt
 local currentBits = ""
 local paintedCells = {}
 local currentCount = 0
@@ -1124,7 +1266,7 @@ local pointerStart = Vector2.zero
 local panStart = Vector2.zero
 local pointerMoved = false
 local lastPaintSent = 0
-local autoBrush = false
+local selectedAbility
 local touchPositions = {}
 local lastPinchDistance
 local adminPanel
@@ -1167,6 +1309,13 @@ local function updateGems(value)
     gemsLabel.Text = "Gems  " .. tostring(profile.Gems or 0)
 end
 
+local function refreshAbilityButtons()
+    local upgrades = profile.Upgrades or {}
+    areaButton.Text = "Area  L" .. tostring(upgrades.AreaBrush or 0)
+    hintButton.Text = "Hint  L" .. tostring(upgrades.ColorHint or 0)
+    autoButton.Text = "Auto Brush  L" .. tostring(upgrades.AutoBrush or 0)
+end
+
 local function updateProfile(data)
     if type(data) ~= "table" then
         return
@@ -1177,6 +1326,7 @@ local function updateProfile(data)
     if type(data.Upgrades) == "table" then
         profile.Upgrades = data.Upgrades
     end
+    refreshAbilityButtons()
     if type(data.Progress) == "table" then
         profile.Progress = data.Progress
     end
@@ -1249,7 +1399,9 @@ local function loadArts()
     for _, module in ipairs(artLibrary:GetChildren()) do
         if module:IsA("ModuleScript") then
             local ok, art = pcall(require, module)
-            if ok and type(art) == "table" and art.Id and art.Width and art.Height then
+            local hasFixedPixels = type(art) == "table" and art.Width and art.Height and art.Pixels
+            local hasVariants = type(art) == "table" and type(art.Variants) == "table"
+            if ok and type(art) == "table" and art.Id and (hasFixedPixels or hasVariants) then
                 arts[#arts + 1] = art
                 artById[art.Id] = art
             end
@@ -1258,6 +1410,30 @@ local function loadArts()
     table.sort(arts, function(a, b)
         return tostring(a.Name) < tostring(b.Name)
     end)
+end
+
+local function clientVariantFor(art, difficulty)
+    if type(art.Variants) == "table" then
+        return art.Variants[difficulty]
+    end
+    return art
+end
+
+local function clientProgressKey(art, difficulty)
+    return art.Id .. "@" .. tostring(difficulty)
+end
+
+local function defaultClientVariant(art)
+    if type(art.Variants) == "table" then
+        return art.Variants.Easy or art.Variants.Medium or art.Variants.Hard or art.Variants["Extreme / Unreal"]
+    end
+    return art
+end
+
+local function artDifficulties(art)
+    -- The server supplies a nearest-neighbour fallback for both legacy
+    -- single-resolution modules and partial Variants tables.
+    return table.clone(Config.DifficultyOrder)
 end
 
 local function makeEditableImage(width, height)
@@ -1278,23 +1454,12 @@ local function makeEditableImage(width, height)
 end
 
 local function colorForPixel(colorId, painted)
-    local color = currentArt.Palette[colorId] or Color3.fromRGB(255, 255, 255)
-    if painted then
-        return color
+    if not painted then
+        -- Never reveal source colors before the player paints. The sheet is
+        -- genuinely white; only the virtual number overlay supplies guidance.
+        return Color3.fromRGB(255, 255, 255)
     end
-    -- Unpainted pixels stay neutral. The palette remains colorful, while
-    -- the canvas matches a real paint-by-numbers sheet instead of showing
-    -- the finished image before the player has painted anything.
-    local luminance = color.R * 0.299 + color.G * 0.587 + color.B * 0.114
-    if colorId == selectedColor then
-        return Color3.new(
-            clamp(0.80 + luminance * 0.14, 0, 1),
-            clamp(0.88 + luminance * 0.10, 0, 1),
-            1
-        )
-    end
-    local shade = clamp(0.90 + luminance * 0.06, 0.90, 0.97)
-    return Color3.new(shade, shade, shade)
+    return currentArt.Palette[colorId] or Color3.fromRGB(255, 255, 255)
 end
 
 local function paintPixelColor(image, x, y, color)
@@ -1455,6 +1620,9 @@ local function renderNumberOverlay()
     local firstY = math.max(1, math.floor((viewTopLeft.Y - topLeft.Y) / cellHeight) + 1)
     local lastX = math.min(width, math.ceil((viewBottomRight.X - topLeft.X) / cellWidth))
     local lastY = math.min(height, math.ceil((viewBottomRight.Y - topLeft.Y) / cellHeight))
+    if firstX > lastX or firstY > lastY then
+        return
+    end
     local made = 0
     -- Easy can show its complete 32x32 number sheet. Larger canvases are
     -- virtualized and capped; zoom/pan reveals more numbers without creating
@@ -1631,23 +1799,23 @@ local function showVictory(reward)
     victory.Visible = true
 end
 
-local function sendPaint(x, y)
+local function sendPaint(x, y, continuous)
     if not currentArt or victory.Visible then
         return
     end
     local now = os.clock()
-    if now - lastPaintSent < 0.035 then
+    if now - lastPaintSent < (continuous and 0.045 or 0.035) then
         return
     end
     lastPaintSent = now
-    local result = invoke(PaintPixel, currentArtId, x, y, selectedColor)
+    local result = invoke(PaintPixel, currentArtId, x, y, selectedColor, continuous == true)
     if result.Ok then
         if paintedCells[(y - 1) * currentArt.Width + x] ~= true then
             updateBitsForPaint(x, y)
         end
         local index = (y - 1) * currentArt.Width + x
         currentCount = result.Count or currentCount
-        profile.Progress[currentArtId] = { Count = currentCount, Complete = result.Completed == true }
+        profile.Progress[currentProgressKey or currentArtId] = { Count = currentCount, Complete = result.Completed == true }
         updateGems(result.Gems)
         updateSingleCanvasPixel(x, y)
         removeNumberLabel(index)
@@ -1671,8 +1839,12 @@ local function useAbility(abilityName, x, y)
         -- Abilities return one exact bitset because they may affect many
         -- cells at once; normal clicks update only the local boolean table.
         currentCount = result.Count or currentCount
-        profile.Progress[currentArtId] = { Count = currentCount, Complete = result.Completed == true }
+        profile.Progress[currentProgressKey or currentArtId] = { Count = currentCount, Complete = result.Completed == true }
         updateGems(result.Gems)
+        if result.HintColor then
+            selectedColor = result.HintColor
+            showToast("Hint: color " .. tostring(result.HintColor) .. " • " .. tostring(result.HintCount or 0) .. " pixels")
+        end
         if result.Changed and result.Changed > 0 and result.Bits then
             -- The server returns one exact bitset for the whole ability, so
             -- the client does not need to restart the art session.
@@ -1725,7 +1897,7 @@ local function buildPalette()
         button.BackgroundColor3 = paletteColor
         button.BackgroundTransparency = 0
         button.BorderSizePixel = 0
-        button.Size = currentArt.PaletteSize <= 8 and UDim2.new(1 / currentArt.PaletteSize, -2, 1, -2) or UDim2.fromOffset(64, 82)
+        button.Size = currentArt.PaletteSize <= 8 and UDim2.new(1 / currentArt.PaletteSize, -2, 1, -10) or UDim2.fromOffset(64, 64)
         button.AutoButtonColor = true
         button.Active = true
         button.Parent = paletteButtons
@@ -1750,8 +1922,16 @@ local function buildPalette()
 end
 
 local function artProgress(art)
-    local saved = profile.Progress and profile.Progress[art.Id]
-    return saved and tonumber(saved.Count) or 0
+    local variant = defaultClientVariant(art)
+    if not variant then
+        return 0, 1
+    end
+    local difficulty = variant.Difficulty or art.Difficulty or "Easy"
+    local saved = profile.Progress and profile.Progress[clientProgressKey(art, difficulty)]
+    if not saved and type(art.Variants) ~= "table" and difficulty == art.Difficulty then
+        saved = profile.Progress and profile.Progress[art.Id]
+    end
+    return saved and tonumber(saved.Count) or 0, variant.Width * variant.Height
 end
 
 local function renderPreview(imageLabel, art)
@@ -1784,6 +1964,81 @@ local function renderPreview(imageLabel, art)
     end
 end
 
+local function startArt(art, difficulty)
+    local response = invoke(StartArt, art.Id, difficulty)
+    if not response.Ok then
+        showToast(reasonText(response), true)
+        return
+    end
+    currentArtId = art.Id
+    currentDifficulty = response.Art.Difficulty
+    currentProgressKey = response.ProgressKey or clientProgressKey(art, currentDifficulty)
+    currentArt = response.Art
+    setPaintedCells(response.Bits or "", currentArt.Width * currentArt.Height)
+    currentCount = response.Count or 0
+    profile.Upgrades = response.Upgrades or profile.Upgrades
+    refreshAbilityButtons()
+    updateGems(response.Gems)
+    selectedColor = 1
+    zoom = 1
+    pan = Vector2.zero
+    pointerDown = false
+    canvasImage = makeEditableImage(currentArt.Width, currentArt.Height)
+    canvasImageUsable = canvasImage ~= nil
+    virtualLayer.Visible = not canvasImageUsable
+    paintingName.Text = currentArt.Name
+    paintingDifficulty.Text = currentArt.Difficulty
+    victory.Visible = false
+    buildPalette()
+    if difficultyModal then difficultyModal.Visible = false end
+    home.Visible = false
+    catalog.Visible = false
+    shop.Visible = false
+    paint.Visible = true
+    task.defer(function()
+        layoutCanvas()
+        renderCanvas()
+    end)
+end
+
+local function openDifficultyPicker(art)
+    pendingArt = art
+    if not difficultyModal or not difficultyButtons or not difficultyTemplate then
+        startArt(art, art.Difficulty or "Easy")
+        return
+    end
+    for _, child in ipairs(difficultyButtons:GetChildren()) do
+        if child:GetAttribute("PBNDifficultyButton") then
+            child:Destroy()
+        end
+    end
+    if difficultyArtName then
+        difficultyArtName.Text = art.Name
+    end
+    for order, difficulty in ipairs(artDifficulties(art)) do
+        local variant = clientVariantFor(art, difficulty)
+        local size = variant and variant.Width or Config.AllowedSizes[difficulty]
+        local saved = profile.Progress and profile.Progress[clientProgressKey(art, difficulty)]
+        if not saved and type(art.Variants) ~= "table" and difficulty == art.Difficulty then
+            saved = profile.Progress and profile.Progress[art.Id]
+        end
+        local savedCount = saved and tonumber(saved.Count) or 0
+        local total = size * size
+        local percentage = math.floor(savedCount / math.max(total, 1) * 100 + 0.5)
+        local button = difficultyTemplate:Clone()
+        button.Name = "Difficulty_" .. tostring(difficulty):gsub("[^%w]", "")
+        button:SetAttribute("PBNDifficultyButton", true)
+        button.Visible = true
+        button.LayoutOrder = order
+        button.Text = string.format("%s   %dx%d   %d%%", difficulty, size, size, percentage)
+        button.Parent = difficultyButtons
+        button.Activated:Connect(function()
+            startArt(art, difficulty)
+        end)
+    end
+    difficultyModal.Visible = true
+end
+
 local function renderCatalog()
     for _, child in ipairs(levelGrid:GetChildren()) do
         if child:GetAttribute("PBNCard") then
@@ -1806,51 +2061,24 @@ local function renderCatalog()
         local preview = card:FindFirstChild("Preview", true)
         local completion = card:FindFirstChild("CompletionMark", true)
         local select = card:FindFirstChild("Select", true)
-        local count = artProgress(art)
-        local total = art.Width * art.Height
-        local percentage = math.floor(count / total * 100 + 0.5)
+        local previewArt = defaultClientVariant(art)
+        local count, total = artProgress(art)
+        local percentage = math.floor(count / math.max(total, 1) * 100 + 0.5)
         if title then title.Text = art.Name end
-        if difficulty then difficulty.Text = art.Difficulty end
-        if reward then reward.Text = "+" .. tostring(art.Reward or 0) .. " gems" end
+        if difficulty then
+            difficulty.Text = type(art.Variants) == "table" and "Easy • Medium • Hard • Extreme" or tostring(art.Difficulty or "Easy")
+        end
+        if reward then reward.Text = "+" .. tostring((previewArt and previewArt.Reward) or art.Reward or 0) .. " gems" end
         if progress then progress.Text = tostring(percentage) .. "%" end
         if completion then
-            completion.Text = count >= total and "✓" or "✓"
+            completion.Text = "✓"
             completion.TextColor3 = count >= total and Color3.fromRGB(91, 176, 74) or Color3.fromRGB(126, 139, 153)
         end
-        if fill then fill.Size = UDim2.new(clamp(count / total, 0, 1), 0, 1, 0) end
-        if preview and preview:IsA("ImageLabel") then renderPreview(preview, art) end
+        if fill then fill.Size = UDim2.new(clamp(count / math.max(total, 1), 0, 1), 0, 1, 0) end
+        if preview and preview:IsA("ImageLabel") and previewArt then renderPreview(preview, previewArt) end
         if select and select:IsA("GuiButton") then
             select.Activated:Connect(function()
-                local response = invoke(StartArt, art.Id)
-                if not response.Ok then
-                    showToast(reasonText(response), true)
-                    return
-                end
-                currentArtId = art.Id
-                currentArt = response.Art
-                setPaintedCells(response.Bits or "", currentArt.Width * currentArt.Height)
-                currentCount = response.Count or 0
-                profile.Upgrades = response.Upgrades or profile.Upgrades
-                updateGems(response.Gems)
-                selectedColor = 1
-                zoom = 1
-                pan = Vector2.zero
-                pointerDown = false
-                canvasImage = makeEditableImage(currentArt.Width, currentArt.Height)
-                canvasImageUsable = canvasImage ~= nil
-                virtualLayer.Visible = not canvasImageUsable
-                paintingName.Text = currentArt.Name
-                paintingDifficulty.Text = currentArt.Difficulty
-                victory.Visible = false
-                buildPalette()
-                home.Visible = false
-                catalog.Visible = false
-                shop.Visible = false
-                paint.Visible = true
-                task.defer(function()
-                    layoutCanvas()
-                    renderCanvas()
-                end)
+                openDifficultyPicker(art)
             end)
         end
     end
@@ -1861,6 +2089,7 @@ local function openCatalog()
     home.Visible = false
     paint.Visible = false
     catalog.Visible = true
+    if difficultyModal then difficultyModal.Visible = false end
     renderCatalog()
 end
 
@@ -1869,22 +2098,29 @@ local function openHome()
     catalog.Visible = false
     shop.Visible = false
     victory.Visible = false
+    if difficultyModal then difficultyModal.Visible = false end
     home.Visible = true
 end
 
 if navHome then
     navHome.Activated:Connect(openHome)
 end
+if difficultyClose then
+    difficultyClose.Activated:Connect(function()
+        if difficultyModal then difficultyModal.Visible = false end
+        pendingArt = nil
+    end)
+end
 
 local function refreshShop()
     local rows = {
-        { Name = "Splash", Label = shop:FindFirstChild("SplashLevel", true), Button = shop:FindFirstChild("SplashBuy", true) },
-        { Name = "ColorBomb", Label = shop:FindFirstChild("BombLevel", true), Button = shop:FindFirstChild("BombBuy", true) },
-        { Name = "AutoBrush", Label = shop:FindFirstChild("AutoLevel", true), Button = shop:FindFirstChild("AutoBuy", true) },
+        { Name = "AutoBrush", Title = "Auto Brush", Label = shop:FindFirstChild("AutoLevel", true), Button = shop:FindFirstChild("AutoBuy", true) },
+        { Name = "AreaBrush", Title = "Area Brush", Label = shop:FindFirstChild("AreaLevel", true), Button = shop:FindFirstChild("AreaBuy", true) },
+        { Name = "ColorHint", Title = "Color Hint", Label = shop:FindFirstChild("HintLevel", true), Button = shop:FindFirstChild("HintBuy", true) },
     }
     for _, row in ipairs(rows) do
         local level = tonumber(profile.Upgrades[row.Name]) or 0
-        if row.Label then row.Label.Text = row.Name .. "  •  level " .. tostring(level) .. "/" .. tostring(Config.UpgradeMaxLevel) end
+        if row.Label then row.Label.Text = row.Title .. "  •  level " .. tostring(level) .. "/" .. tostring(Config.UpgradeMaxLevel) end
         if row.Button then
             if level >= Config.UpgradeMaxLevel then
                 row.Button.Text = "MAX"
@@ -1904,11 +2140,7 @@ local function buyUpgrade(abilityName)
         updateProfile(result)
         refreshShop()
         showToast(abilityName .. " upgraded.")
-        if currentArt then
-            splashButton.Text = "Splash  L" .. tostring(profile.Upgrades.Splash or 0)
-            bombButton.Text = "Color Bomb  L" .. tostring(profile.Upgrades.ColorBomb or 0)
-            autoButton.Text = "Auto-Brush  L" .. tostring(profile.Upgrades.AutoBrush or 0)
-        end
+        refreshAbilityButtons()
     else
         showToast(reasonText(result), true)
     end
@@ -1998,13 +2230,13 @@ local function createAdminPanel()
             if action[2] == "InstantComplete" then
                 setPaintedCells(result.Bits or currentBits, currentArt.Width * currentArt.Height)
                 currentCount = result.Count or currentCount
-                profile.Progress[currentArtId] = { Count = currentCount, Complete = true }
+                profile.Progress[currentProgressKey or currentArtId] = { Count = currentCount, Complete = true }
                 renderCanvas()
                 showVictory(result.Reward)
             elseif action[2] == "ResetArtProgress" then
                 setPaintedCells(result.Bits or string.rep("0", currentArt.Width * currentArt.Height), currentArt.Width * currentArt.Height)
                 currentCount = 0
-                profile.Progress[currentArtId] = { Count = 0, Complete = false }
+                profile.Progress[currentProgressKey or currentArtId] = { Count = 0, Complete = false }
                 renderCanvas()
                 showToast("Current art progress reset.")
             elseif action[2] == "MaxUpgrades" then
@@ -2017,28 +2249,26 @@ local function createAdminPanel()
     end
 end
 
-splashButton.Activated:Connect(function()
-    autoBrush = false
-    showToast("Tap a pixel to use Splash.")
+areaButton.Activated:Connect(function()
+    selectedAbility = "AreaBrush"
+    showToast("Tap a pixel to use Area Brush.")
 end)
-bombButton.Activated:Connect(function()
-    autoBrush = false
-    showToast("Tap a pixel to use Color Bomb.")
+hintButton.Activated:Connect(function()
+    selectedAbility = nil
+    if currentArt then
+        useAbility("ColorHint", 1, 1)
+    else
+        showToast("Open an art first.", true)
+    end
 end)
 autoButton.Activated:Connect(function()
+    selectedAbility = nil
     if (profile.Upgrades.AutoBrush or 0) < 1 then
-        autoBrush = false
-        showToast("Upgrade Auto-Brush in the shop first.", true)
-        return
+        showToast("Upgrade Auto Brush in the shop first.", true)
+    else
+        showToast("Hold the mouse button and drag to paint continuously.")
     end
-    autoBrush = not autoBrush
-    autoButton.Text = (autoBrush and "Auto-Brush  ON" or "Auto-Brush  OFF")
 end)
-
-local selectedAbility
-splashButton.Activated:Connect(function() selectedAbility = "Splash" end)
-bombButton.Activated:Connect(function() selectedAbility = "ColorBomb" end)
-autoButton.Activated:Connect(function() selectedAbility = nil end)
 
 canvasViewport.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -2087,11 +2317,12 @@ UserInputService.InputChanged:Connect(function(input)
         local delta = position - pointerStart
         if delta.Magnitude > 5 then
             pointerMoved = true
-            pan = panStart + delta
-            layoutCanvas()
-            if autoBrush then
+            if (profile.Upgrades.AutoBrush or 0) >= 1 then
                 local x, y = cellAtScreenPosition(position)
-                if x and y then sendPaint(x, y) end
+                if x and y then sendPaint(x, y, true) end
+            else
+                pan = panStart + delta
+                layoutCanvas()
             end
         end
     elseif input.UserInputType == Enum.UserInputType.Touch then
@@ -2102,11 +2333,12 @@ UserInputService.InputChanged:Connect(function(input)
                 local delta = position - pointerStart
                 if delta.Magnitude > 5 then
                     pointerMoved = true
-                    pan = panStart + delta
-                    layoutCanvas()
-                    if autoBrush then
+                    if (profile.Upgrades.AutoBrush or 0) >= 1 then
                         local x, y = cellAtScreenPosition(position)
-                        if x and y then sendPaint(x, y) end
+                        if x and y then sendPaint(x, y, true) end
+                    else
+                        pan = panStart + delta
+                        layoutCanvas()
                     end
                 end
             end
@@ -2151,8 +2383,8 @@ victoryClose.Activated:Connect(function()
     openCatalog()
 end)
 
-shop:FindFirstChild("SplashBuy", true).Activated:Connect(function() buyUpgrade("Splash") end)
-shop:FindFirstChild("BombBuy", true).Activated:Connect(function() buyUpgrade("ColorBomb") end)
+shop:FindFirstChild("AreaBuy", true).Activated:Connect(function() buyUpgrade("AreaBrush") end)
+shop:FindFirstChild("HintBuy", true).Activated:Connect(function() buyUpgrade("ColorHint") end)
 shop:FindFirstChild("AutoBuy", true).Activated:Connect(function() buyUpgrade("AutoBrush") end)
 
 ProfileChanged.OnClientEvent:Connect(function(data)
@@ -2526,6 +2758,31 @@ local navHome = navItem("Home", "▣\nГлавная", 1)
 navHome.TextColor3 = C.Text
 navItem("Works", "▧\nМои работы", 2)
 
+local difficultyModal = panel(catalogFrame, "DifficultyModal", UDim2.new(0.84, 0, 0, 330), UDim2.new(0.08, 0, 0.5, -165))
+difficultyModal.Visible = false
+difficultyModal.ZIndex = 20
+difficultyModal.BackgroundColor3 = C.Panel
+local difficultyTitle = text(difficultyModal, "DifficultyTitle", "CHOOSE DIFFICULTY", UDim2.new(1, -70, 0, 34), UDim2.fromOffset(20, 18), 20, styleLabel)
+difficultyTitle.TextXAlignment = Enum.TextXAlignment.Center
+difficultyTitle.TextColor3 = C.Text
+local difficultyArtNameLabel = text(difficultyModal, "DifficultyArtName", "Painting", UDim2.new(1, -40, 0, 24), UDim2.fromOffset(20, 53), 13, styleLabel)
+difficultyArtNameLabel.TextXAlignment = Enum.TextXAlignment.Center
+difficultyArtNameLabel.TextColor3 = C.Muted
+local difficultyCloseButton = button(difficultyModal, "DifficultyClose", "×", UDim2.fromOffset(38, 36), UDim2.new(1, -52, 0, 14))
+difficultyCloseButton.ZIndex = 22
+local difficultyList = ui(difficultyModal, "Frame", "DifficultyButtons", nil, false)
+difficultyList.Size = UDim2.new(1, -40, 0, 220)
+difficultyList.Position = UDim2.fromOffset(20, 92)
+difficultyList.BackgroundTransparency = 1
+difficultyList.BorderSizePixel = 0
+local difficultyListLayout = Instance.new("UIListLayout")
+difficultyListLayout.Padding = UDim.new(0, 8)
+difficultyListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+difficultyListLayout.Parent = difficultyList
+local difficultyButtonTemplate = button(difficultyModal, "DifficultyTemplate", "Easy  32x32", UDim2.new(1, -40, 0, 44), UDim2.fromOffset(20, 92))
+difficultyButtonTemplate.Visible = false
+difficultyButtonTemplate.ZIndex = 21
+
 -- Painting screen
 local paintFrame = ui(rootFrame, "Frame", "Paint", nil, false)
 paintFrame.Size = UDim2.fromScale(1, 1)
@@ -2598,6 +2855,8 @@ palette.BorderSizePixel = 0
 palette.ScrollBarThickness = 3
 palette.ScrollBarImageColor3 = Color3.fromRGB(255, 255, 255)
 palette.ScrollingDirection = Enum.ScrollingDirection.X
+palette.CanvasSize = UDim2.fromOffset(0, 0)
+palette.AutomaticCanvasSize = Enum.AutomaticSize.X
 local paletteLayout = Instance.new("UIListLayout")
 paletteLayout.FillDirection = Enum.FillDirection.Horizontal
 paletteLayout.Padding = UDim.new(0, 2)
@@ -2611,22 +2870,32 @@ paletteDots.TextColor3 = Color3.fromRGB(205, 220, 248)
 local hint = text(paintFrame, "ColorHint", "Selected color 1", UDim2.fromOffset(1, 1), UDim2.fromOffset(0, 0), 1, styleLabel)
 hint.Visible = false
 hint.ZIndex = 4
-local splash = button(paintFrame, "SplashButton", "Splash  L0", UDim2.fromOffset(112, 30), UDim2.new(0, 22, 1, -118))
-splash.BackgroundColor3 = Color3.fromRGB(42, 89, 181)
-splash.TextColor3 = Color3.fromRGB(255, 255, 255)
-splash.TextSize = 11
-splash.ZIndex = 5
-local bomb = button(paintFrame, "ColorBombButton", "Bomb  L0", UDim2.fromOffset(112, 30), UDim2.new(0, 140, 1, -118))
-bomb.BackgroundColor3 = Color3.fromRGB(42, 89, 181)
-bomb.TextColor3 = Color3.fromRGB(255, 255, 255)
-bomb.TextSize = 11
-bomb.ZIndex = 5
-local auto = button(paintFrame, "AutoBrushButton", "Auto  L0", UDim2.fromOffset(112, 30), UDim2.new(0, 258, 1, -118))
-auto.BackgroundColor3 = Color3.fromRGB(42, 89, 181)
-auto.TextColor3 = Color3.fromRGB(255, 255, 255)
-auto.TextSize = 11
-auto.ZIndex = 5
-
+local abilityBar = ui(paintFrame, "Frame", "AbilityBar", nil, false)
+abilityBar.Size = UDim2.new(0.92, 0, 0, 34)
+abilityBar.Position = UDim2.new(0.04, 0, 1, -122)
+abilityBar.BackgroundTransparency = 1
+abilityBar.BorderSizePixel = 0
+local abilityLayout = Instance.new("UIListLayout")
+abilityLayout.FillDirection = Enum.FillDirection.Horizontal
+abilityLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+abilityLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+abilityLayout.Padding = UDim.new(0, 6)
+abilityLayout.Parent = abilityBar
+local function abilityButton(name, label)
+    local ability = button(abilityBar, name, label, UDim2.new(1 / 3, -4, 1, -4), UDim2.fromOffset(0, 2))
+    ability.BackgroundColor3 = Color3.fromRGB(42, 89, 181)
+    ability.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ability.TextSize = 11
+    ability.ZIndex = 5
+    local constraint = Instance.new("UISizeConstraint")
+    constraint.MaxSize = Vector2.new(112, 30)
+    constraint.MinSize = Vector2.new(72, 30)
+    constraint.Parent = ability
+    return ability
+end
+local auto = abilityButton("AutoBrushButton", "Auto Brush  L0")
+local area = abilityButton("AreaBrushButton", "Area  L0")
+local hintAbility = abilityButton("ColorHintButton", "Hint  L0")
 local victoryModal = panel(paintFrame, "VictoryModal", UDim2.new(0.9, 0, 0, 250), UDim2.new(0.05, 0, 0.5, -125))
 victoryModal.Visible = false
 victoryModal.ZIndex = 30
@@ -2664,9 +2933,9 @@ local function shopRow(name, labelName, buyName, y, description)
     local buy = button(row, buyName, "Upgrade", UDim2.fromOffset(118, 42), UDim2.new(1, -132, 0.5, -21))
     buy.TextSize = 13
 end
-shopRow("Splash", "SplashLevel", "SplashBuy", 94, "Paint a 3x3, 5x5, or 7x7 correct area.")
-shopRow("Color Bomb", "BombLevel", "BombBuy", 188, "Fill every remaining pixel of the selected number.")
-shopRow("Auto-Brush", "AutoLevel", "AutoBuy", 282, "Paint continuously while dragging.")
+shopRow("Auto Brush", "AutoLevel", "AutoBuy", 94, "Hold the mouse button or touch to paint continuously.")
+shopRow("Area Brush", "AreaLevel", "AreaBuy", 188, "Level 1: 1x2 • Level 2: 2x2 • Level 3: 3x3.")
+shopRow("Color Hint", "HintLevel", "HintBuy", 282, "Suggests the color with the most pixels left.")
 
 local toastLabel = text(rootFrame, "Toast", "", UDim2.fromOffset(420, 38), UDim2.new(0.5, -210, 0, -48), 14, styleLabel)
 toastLabel.BackgroundColor3 = C.Panel2
